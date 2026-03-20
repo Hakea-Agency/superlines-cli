@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""
+Superlines CLI — AEO analytics from the command line.
+
+Track brand visibility in AI-generated answers (ChatGPT, Perplexity, Google AI).
+
+Usage:
+  superlines metrics <brand>                 # Key AEO metrics
+  superlines brands [brand]                  # Brand mentions + sentiment + SOV
+  superlines citations [brand]               # Citation data (domain or URL level)
+  superlines queries [brand]                 # Query/prompt data
+  superlines prompts [brand]                 # List tracked prompts
+  superlines responses [brand]               # Raw AI response data
+
+Global options:
+  --start YYYY-MM-DD     Start date
+  --end YYYY-MM-DD       End date
+  --granularity G        total|daily|weekly|monthly (default: total)
+  --group-by FIELD       Group results by dimension
+  --limit N              Max results (default: 50)
+  --format FMT           table|csv|json (default: table)
+  --json                 Shortcut for --format json
+
+Authentication:
+  Set SUPERLINES_API_KEY environment variable, or configure in
+  ~/.config/superlines/config.json:
+  { "api_key_command": "your-command-to-get-key" }
+"""
+
+__version__ = "2.0.0"
+
+import sys
+import json
+import os
+import csv
+import io
+import subprocess
+import argparse
+import urllib.request
+import urllib.error
+import urllib.parse
+from pathlib import Path
+from datetime import datetime
+
+API_BASE = "https://api.superlines.io"
+CONFIG_DIR = Path.home() / ".config" / "superlines"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+
+def load_config() -> dict:
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def get_api_key() -> str:
+    """Get API key from env or config."""
+    key = os.environ.get("SUPERLINES_API_KEY")
+    if key:
+        return key
+
+    config = load_config()
+    cmd = config.get("api_key_command")
+    if cmd:
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+
+    print("ERROR: No API key found.")
+    print("Set SUPERLINES_API_KEY env var, or create ~/.config/superlines/config.json:")
+    print('  { "api_key_command": "your-command-to-get-key" }')
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# REST API
+# ---------------------------------------------------------------------------
+
+def api_call(params: dict, api_key: str, method: str = "POST") -> dict:
+    """Call Superlines REST API. Returns parsed JSON response."""
+    params = {k: v for k, v in params.items() if v is not None}
+
+    if method == "GET":
+        # Flatten lists for GET params
+        flat = {}
+        for k, v in params.items():
+            if isinstance(v, list):
+                flat[k] = ",".join(str(x) for x in v)
+            elif isinstance(v, bool):
+                flat[k] = str(v).lower()
+            else:
+                flat[k] = v
+        query = urllib.parse.urlencode(flat)
+        url = f"{API_BASE}?{query}"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        })
+    else:
+        url = API_BASE
+        data = json.dumps(params).encode()
+        req = urllib.request.Request(url, data=data, headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode()[:500]
+        except Exception:
+            pass
+        if e.code == 429:
+            reset = e.headers.get("X-RateLimit-Reset", "unknown")
+            print(f"ERROR: Rate limited. Reset at: {reset}", file=sys.stderr)
+        elif e.code == 401:
+            print("ERROR: Invalid API key.", file=sys.stderr)
+        elif e.code == 403:
+            print("ERROR: Access denied. Check your Superlines plan.", file=sys.stderr)
+        else:
+            print(f"ERROR: HTTP {e.code}: {e.reason}", file=sys.stderr)
+        if body:
+            try:
+                err = json.loads(body)
+                msg = err.get("message", err.get("error", body))
+                print(f"  {msg}", file=sys.stderr)
+            except json.JSONDecodeError:
+                print(f"  {body}", file=sys.stderr)
+        sys.exit(1)
+    except urllib.error.URLError as e:
+        print(f"ERROR: Connection failed: {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except TimeoutError:
+        print("ERROR: Request timed out (120s)", file=sys.stderr)
+        sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+def truncate(s: str, max_len: int = 60) -> str:
+    s = str(s)
+    return s[:max_len - 1] + "…" if len(s) > max_len else s
+
+
+def format_table(rows: list[dict]) -> str:
+    if not rows:
+        return "(no results)"
+    if not isinstance(rows[0], dict):
+        return "\n".join(str(r) for r in rows)
+
+    cols = list(rows[0].keys())
+    widths = {}
+    for c in cols:
+        col_vals = [truncate(str(row.get(c, ""))) for row in rows]
+        widths[c] = min(max(len(str(c)), max(len(v) for v in col_vals)), 60)
+
+    header = " | ".join(str(c).ljust(widths[c]) for c in cols)
+    sep = "-+-".join("-" * widths[c] for c in cols)
+    lines = [header, sep]
+    for row in rows:
+        line = " | ".join(truncate(str(row.get(c, ""))).ljust(widths[c]) for c in cols)
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def format_csv_output(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    return buf.getvalue()
+
+
+def format_kv(data: dict) -> str:
+    return "\n".join(f"  {k}: {v}" for k, v in data.items())
+
+
+def output(response: dict, args):
+    """Format and print API response."""
+    fmt = getattr(args, "format", None) or ("json" if getattr(args, "json", False) else "table")
+
+    if fmt == "json":
+        print(json.dumps(response, indent=2, ensure_ascii=False))
+        return
+
+    # Extract data from response
+    data = response.get("data", response)
+    metadata = response.get("metadata", {})
+
+    if isinstance(data, list):
+        if not data:
+            print("(no results)")
+        elif isinstance(data[0], dict):
+            if fmt == "csv":
+                print(format_csv_output(data))
+            else:
+                print(format_table(data))
+        else:
+            print("\n".join(str(r) for r in data))
+    elif isinstance(data, dict):
+        print(format_kv(data))
+    else:
+        print(data)
+
+    # Show metadata summary
+    if metadata and fmt == "table":
+        total = metadata.get("totalRows", "")
+        exec_time = metadata.get("executionTime", "")
+        parts = []
+        if total: parts.append(f"{total} rows")
+        if exec_time: parts.append(exec_time)
+        if parts:
+            print(f"\n  {' | '.join(parts)}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def build_params(args, endpoint: str) -> dict:
+    """Build common API params from args."""
+    params = {"endpoint": endpoint}
+
+    brand = getattr(args, "brand", None)
+    if brand:
+        params["brands"] = [brand]
+
+    if hasattr(args, "start") and args.start:
+        params["startDate"] = args.start
+    if hasattr(args, "end") and args.end:
+        params["endDate"] = args.end
+    if hasattr(args, "granularity") and args.granularity:
+        params["granularity"] = args.granularity
+    if hasattr(args, "group_by") and args.group_by:
+        params["groupBy"] = args.group_by.split(",")
+    if hasattr(args, "limit") and args.limit:
+        params["topN"] = args.limit
+    if hasattr(args, "labels") and args.labels:
+        params["labels"] = args.labels.split(",")
+
+    return params
+
+
+def cmd_metrics(args, api_key):
+    params = build_params(args, "metrics")
+    metrics_list = ["brand_visibility", "citation_rate", "citations",
+                    "share_of_voice", "mentions"]
+    if hasattr(args, "metrics") and args.metrics:
+        metrics_list = args.metrics.split(",")
+    params["metrics"] = metrics_list
+
+    response = api_call(params, api_key)
+    output(response, args)
+
+
+def cmd_brands(args, api_key):
+    params = build_params(args, "brands")
+    if hasattr(args, "include_sentiment"):
+        params["includeSentiment"] = args.include_sentiment
+    if hasattr(args, "include_sov"):
+        params["includeShareOfVoice"] = args.include_sov
+    if hasattr(args, "min_mentions") and args.min_mentions:
+        params["minMentions"] = args.min_mentions
+
+    response = api_call(params, api_key)
+    output(response, args)
+
+
+def cmd_citations(args, api_key):
+    params = build_params(args, "citations")
+    if hasattr(args, "aggregate") and args.aggregate:
+        params["aggregateBy"] = args.aggregate
+
+    response = api_call(params, api_key)
+    output(response, args)
+
+
+def cmd_queries(args, api_key):
+    params = build_params(args, "queries")
+    if hasattr(args, "sort_by") and args.sort_by:
+        params["sortBy"] = args.sort_by
+    if hasattr(args, "min_volume") and args.min_volume:
+        params["minVolume"] = args.min_volume
+
+    response = api_call(params, api_key)
+    output(response, args)
+
+
+def cmd_prompts(args, api_key):
+    params = build_params(args, "prompts")
+    if hasattr(args, "status") and args.status:
+        params["status"] = args.status
+    if hasattr(args, "intent") and args.intent:
+        params["intent"] = args.intent
+    if hasattr(args, "sort_by") and args.sort_by:
+        params["sortBy"] = args.sort_by
+
+    response = api_call(params, api_key)
+    output(response, args)
+
+
+def cmd_responses(args, api_key):
+    params = build_params(args, "responses")
+    if hasattr(args, "include_full_text") and args.include_full_text:
+        params["includeFullText"] = True
+    if hasattr(args, "sort_by") and args.sort_by:
+        params["sortBy"] = args.sort_by
+
+    response = api_call(params, api_key)
+    output(response, args)
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="superlines",
+        description="Superlines AEO Analytics CLI — track brand visibility in AI-generated answers.",
+    )
+    parser.add_argument("--version", action="version", version=f"superlines {__version__}")
+    sub = parser.add_subparsers(dest="command")
+
+    def add_common(p, brand_required=False):
+        if brand_required:
+            p.add_argument("brand", help="Brand name")
+        else:
+            p.add_argument("brand", nargs="?", help="Brand name (omit for all brands)")
+        p.add_argument("--start", help="Start date YYYY-MM-DD")
+        p.add_argument("--end", help="End date YYYY-MM-DD")
+        p.add_argument("--granularity", choices=["total", "daily", "weekly", "monthly"],
+                       help="Time granularity (default: total)")
+        p.add_argument("--group-by", help="Group by dimension(s), comma-separated")
+        p.add_argument("--labels", help="Filter by label(s), comma-separated")
+        p.add_argument("--limit", type=int, default=50, help="Max results (default: 50)")
+        p.add_argument("--json", action="store_true", help="Raw JSON output")
+        p.add_argument("--format", choices=["table", "csv", "json"], default="table",
+                       help="Output format (default: table)")
+        return p
+
+    # Metrics
+    p = add_common(sub.add_parser("metrics", help="Key AEO metrics (visibility, citations, SOV)"))
+    p.add_argument("--metrics", help="Comma-separated metrics to fetch (default: all core metrics)")
+
+    # Brands
+    p = add_common(sub.add_parser("brands", help="Brand mentions + sentiment + share of voice"))
+    p.add_argument("--include-sentiment", action="store_true", default=True,
+                   help="Include sentiment data (default: true)")
+    p.add_argument("--include-sov", action="store_true", default=True,
+                   help="Include share of voice (default: true)")
+    p.add_argument("--min-mentions", type=int, help="Minimum mention count")
+
+    # Citations
+    p = add_common(sub.add_parser("citations", help="Citation data (which domains/URLs get cited)"))
+    p.add_argument("--aggregate", choices=["domain", "url"], default="domain",
+                   help="Aggregate by domain or URL (default: domain)")
+
+    # Queries
+    p = add_common(sub.add_parser("queries", help="Search query data"))
+    p.add_argument("--sort-by", choices=["prompts", "query"], help="Sort order")
+    p.add_argument("--min-volume", type=int, help="Minimum volume threshold")
+
+    # Prompts
+    p = add_common(sub.add_parser("prompts", help="List tracked prompts"))
+    p.add_argument("--status", help="Filter by status (active, paused)")
+    p.add_argument("--intent", help="Filter by intent type")
+    p.add_argument("--sort-by", choices=["createdAt", "lastRunAt", "promptText"],
+                   help="Sort order")
+
+    # Responses
+    p = add_common(sub.add_parser("responses", help="Raw AI response data"))
+    p.add_argument("--include-full-text", action="store_true",
+                   help="Include full response text")
+    p.add_argument("--sort-by", choices=["createdAt", "promptId"], help="Sort order")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        sys.exit(0)
+
+    api_key = get_api_key()
+
+    commands = {
+        "metrics": cmd_metrics,
+        "brands": cmd_brands,
+        "citations": cmd_citations,
+        "queries": cmd_queries,
+        "prompts": cmd_prompts,
+        "responses": cmd_responses,
+    }
+
+    fn = commands.get(args.command)
+    if fn:
+        fn(args, api_key)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()
